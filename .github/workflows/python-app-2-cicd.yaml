@@ -1,0 +1,120 @@
+name: python-app-2-cicd
+
+on:
+  push:
+    paths:
+      - src/**
+    branches:
+      - main
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    outputs:
+      commit_id: ${{ steps.commit.outputs.commit_id }}
+    steps:
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Shorten commit id
+        id: commit
+        shell: bash
+        run: |
+          echo "commit_id=${GITHUB_SHA::6}" >> "$GITHUB_OUTPUT"
+          echo "COMMIT_ID=${GITHUB_SHA::6}" >> "$GITHUB_ENV"
+      -
+        name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      -
+        name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          push: true
+          tags: eweka/python-app-2:${{ env.COMMIT_ID }}
+
+  cd:
+    needs: ci
+    runs-on: self-hosted
+    steps:
+
+      - uses: actions/checkout@v3
+
+      - name: Modify values file
+        shell: bash
+        run: |
+          echo "${{ needs.ci.outputs.commit_id }}"
+          if ! command -v yq >/dev/null 2>&1; then
+            ARCH=$(uname -m)
+            if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+              YQ_BIN=yq_linux_arm64
+            else
+              YQ_BIN=yq_linux_amd64
+            fi
+            curl -fsSL -o yq "https://github.com/mikefarah/yq/releases/download/v4.44.3/${YQ_BIN}"
+            chmod +x yq
+            sudo mv yq /usr/local/bin/yq
+          fi
+          yq --version
+          yq eval -i '.image.tag = "${{ needs.ci.outputs.commit_id }}"' charts/python-app-2/values-prod.yaml
+
+      - name: Commit changes
+        uses: EndBug/add-and-commit@v9
+        with:
+          message: "Updates values.yaml with commit ${{ needs.ci.outputs.commit_id }}"
+
+      - name: install argocd
+        shell: bash
+        run: |
+          ARCH=$(uname -m)
+          if [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
+            FILE=argocd-linux-arm64
+          else
+            FILE=argocd-linux-amd64
+          fi
+
+          rm -f argocd
+          sudo rm -f /usr/local/bin/argocd
+
+          curl -fSL -o argocd "https://github.com/argoproj/argo-cd/releases/latest/download/${FILE}"
+          chmod +x argocd
+          sudo mv argocd /usr/local/bin/argocd
+
+          /usr/local/bin/argocd version --client
+
+      - name: argocd login
+        shell: bash
+        run: |
+          argocd login argocd-server.argocd \
+            --insecure  \
+            --grpc-web \
+            --username admin \
+            --password  ${{ secrets.ARGOCD_PASSWORD }}
+
+      - name: Ensure argocd repo and app
+        shell: bash
+        run: |
+
+          # Connects the argocd repo
+          repo="https://github.com/octal-engine/python-app-2.git"
+          argocd repo list | grep -q $repo || argocd repo add $repo
+
+          # Creates the argocd app
+          argocd app get python-app-2 || argocd app create python-app-2 \
+            --repo $repo \
+            --path charts/python-app-2 \
+            --dest-namespace prod \
+            --dest-server https://kubernetes.default.svc \
+            --values values-prod.yaml \
+            --revision main \
+            --sync-policy manual \
+            --sync-option CreateNamespace=true
+
+      - name: Argocd app sync
+        shell: bash
+        run: |
+          argocd app sync python-app-2
+          argocd app wait python-app-2 --timeout 180
